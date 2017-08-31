@@ -2477,6 +2477,18 @@ union bpf_attr {
  * 	Return
  * 		0 if iph and th are a valid SYN cookie ACK, or a negative error
  * 		otherwise.
+ * 
+ * int bpf_skb_ct_lookup(struct sk_buff *skb, struct bpf_conntrack_info *info, u64 flags)
+ *	Description
+ *		Look for Netfilter conntrack state.
+ *	Return
+ *		0 on success or negative error
+ * 
+ * int bpf_skb_ct_commit(struct sk_buff *skb, struct bpf_conntrack_info *info, u64 flags)
+ *	Description
+ *		Commit conntrack state.
+ *	Return
+ *		0 on success or negative error
  */
 #define __BPF_FUNC_MAPPER(FN)		\
 	FN(unspec),			\
@@ -2579,7 +2591,9 @@ union bpf_attr {
 	FN(skb_ecn_set_ce),		\
 	FN(get_listener_sock),		\
 	FN(skc_lookup_tcp),		\
-	FN(tcp_check_syncookie),
+	FN(tcp_check_syncookie),		\
+    FN(skb_ct_lookup),		\
+	FN(skb_ct_commit),
 
 /* integer value in 'imm' field of BPF_CALL instruction selects which helper
  * function eBPF program intends to call
@@ -2722,6 +2736,23 @@ struct bpf_tunnel_key {
 	__u8 tunnel_ttl;
 	__u16 tunnel_ext;	/* Padding, future use. */
 	__u32 tunnel_label;
+};
+
+#define BPF_CT_LABELS_LEN 16
+#define BPF_F_CT_DEFRAG		(1ULL << 0)
+
+struct bpf_conntrack_info {
+	__u32 ct_state;
+	__u16 family;
+	__u16 zone_id;
+
+	/* for conntrack mark */
+	__u32 mark_value;
+	__u32 mark_mask;
+
+	/* for conntrack label */
+	__u8 ct_label_value[16];
+	__u8 ct_label_mask[16];
 };
 
 /* user accessible mirror of in-kernel xfrm_state.

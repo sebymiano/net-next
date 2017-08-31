@@ -76,6 +76,15 @@
 #include <net/lwtunnel.h>
 #include <net/ipv6_stubs.h>
 
+#if IS_ENABLED(CONFIG_NF_CONNTRACK)
+#include <net/netfilter/nf_conntrack_core.h>
+#include <net/netfilter/nf_conntrack.h>
+#include <net/netfilter/nf_conntrack_helper.h>
+#include <net/netfilter/nf_conntrack_labels.h>
+#include <net/netfilter/nf_conntrack_zones.h>
+#endif
+
+
 /**
  *	sk_filter_trim_cap - run a packet through a socket filter
  *	@sk: sock associated with &sk_buff
@@ -3737,6 +3746,229 @@ static unsigned long bpf_skb_copy(void *dst_buff, const void *skb,
 	return 0;
 }
 
+/* Lookup the conntrack with bpf_conntrack_info.
+ * If found, receive the conntrack state, mark, and label
+ */
+BPF_CALL_3(bpf_skb_ct_lookup, struct sk_buff *, skb,
+	   struct bpf_conntrack_info *, info, u64, flags)
+{
+	struct net *net = dev_net(skb->dev);
+	enum ip_conntrack_info ctinfo;
+	struct nf_conntrack_zone zone;
+    struct nf_hook_state hook_state;
+	struct nf_conn_labels *cl;
+	struct nf_conn *ct, *tmpl;
+	int err, nh_ofs;
+	struct iphdr *iph;
+
+	/* Conntrack expects L3 packet */
+	nh_ofs = skb_network_offset(skb);
+	skb_pull_rcsum(skb, nh_ofs);
+	iph = ip_hdr(skb);
+
+	if (ip_is_fragment(iph) && (flags & BPF_F_CT_DEFRAG)) {
+		/* XXX: not test yet */
+		enum ip_defrag_users user =
+			IP_DEFRAG_CONNTRACK_IN + info->zone_id;
+
+		memset(IPCB(skb), 0, sizeof(struct inet_skb_parm));
+		err = ip_defrag(net, skb, user);
+		if (err == -EINPROGRESS)
+			return TC_ACT_STOLEN;
+	}
+
+	/* TODO: conntrack expectation */
+
+	nf_ct_zone_init(&zone, info->zone_id,
+			NF_CT_DEFAULT_ZONE_DIR, 0);
+	tmpl = nf_ct_tmpl_alloc(net, &zone, GFP_ATOMIC);
+	if (!tmpl) {
+		pr_err("Failed to allocate conntrack template\n");
+		goto error;
+	}
+	nf_conntrack_get(&tmpl->ct_general);
+	nf_ct_set(skb, tmpl, IP_CT_NEW);
+    
+    hook_state.pf = info->family;
+    hook_state.net = net;
+    hook_state.hook = NF_INET_PRE_ROUTING;
+    
+	do {
+		err = nf_conntrack_in(skb, &hook_state);
+	} while (err != NF_ACCEPT);
+
+	ct = nf_ct_get(skb, &ctinfo);
+	if (!ct) {
+		pr_err("nf_ct_get failed\n");
+		goto error;
+	}
+
+	info->ct_state = (u8)ctinfo;
+	info->mark_value = ct->mark;
+
+	cl = nf_ct_labels_find(ct);
+	if (cl) {
+		size_t len = sizeof(cl->bits);
+
+		if (len > BPF_CT_LABELS_LEN)
+			len = BPF_CT_LABELS_LEN;
+		else if (len < BPF_CT_LABELS_LEN)
+			memset(info->ct_label_value, 0, BPF_CT_LABELS_LEN);
+		memcpy(info->ct_label_value, cl->bits, len);
+	} else {
+		memset(info->ct_label_value, 0, BPF_CT_LABELS_LEN);
+	}
+
+error:
+	skb_push_rcsum(skb, nh_ofs);
+	return TC_ACT_OK;
+}
+
+static const struct bpf_func_proto bpf_skb_ct_lookup_proto = {
+	.func		= bpf_skb_ct_lookup,
+	.gpl_only	= true,
+	.ret_type	= RET_INTEGER,
+	.arg1_type	= ARG_PTR_TO_CTX,
+	.arg2_type	= ARG_PTR_TO_MEM,
+	.arg3_type	= ARG_ANYTHING,
+};
+
+static int bpf_skb_ct_set_mark(struct sk_buff *skb, u32 ct_mark, u32 mask)
+{
+#if IS_ENABLED(CONFIG_NF_CONNTRACK_MARK)
+	enum ip_conntrack_info ctinfo;
+	struct nf_conn *ct;
+	u32 new_mark;
+
+	ct = nf_ct_get(skb, &ctinfo);
+	if (!ct)
+		return 0;
+
+	new_mark = ct_mark | (ct->mark & ~(mask));
+	if (ct->mark != new_mark)
+		ct->mark = new_mark;
+	return 0;
+#else
+	return -ENOTSUP;
+#endif
+}
+
+static int bpf_skb_ct_set_labels(struct sk_buff *skb,
+				 const u8 *labels, const u8 *mask)
+{
+#if IS_ENABLED(CONFIG_NF_CONNTRACK_LABELS)
+	enum ip_conntrack_info ctinfo;
+	struct nf_conn_labels *cl;
+	struct nf_conn *ct;
+	int err;
+
+	ct = nf_ct_get(skb, &ctinfo);
+	if (!ct)
+		return 0;
+
+	cl = nf_ct_labels_find(ct);
+	if (!cl) {
+		nf_ct_labels_ext_add(ct);
+		cl = nf_ct_labels_find(ct);
+		if (!cl)
+			return -ENOSPC;
+	}
+
+	err = nf_connlabels_replace(ct, (u32 *)labels, (u32 *)mask,
+				    BPF_CT_LABELS_LEN / sizeof(u32));
+	if (err)
+		return err;
+	return 0;
+#else
+	return -ENOTSUP;
+#endif
+}
+
+static bool labels_nonzero(const u8 *labels)
+{
+	int i;
+
+	for (i = 0; i < BPF_CT_LABELS_LEN; i++)
+		if (labels[i])
+			return true;
+	return false;
+}
+
+/* Take the skb and do nf_conntrack_in first,
+ * set mark and labels, and confirm
+ */
+BPF_CALL_3(bpf_skb_ct_commit, struct sk_buff *, skb,
+	   struct bpf_conntrack_info *, info, u64, flags)
+{
+	struct net *net = dev_net(skb->dev);
+	enum ip_conntrack_info ctinfo;
+	struct nf_conntrack_zone zone;
+    struct nf_hook_state hook_state;
+	struct nf_conn *ct, *tmpl;
+	int err, nh_ofs;
+
+	/* Conntrack expects L3 packet */
+	nh_ofs = skb_network_offset(skb);
+	skb_pull_rcsum(skb, nh_ofs);
+
+	nf_ct_zone_init(&zone, info->zone_id,
+			NF_CT_DEFAULT_ZONE_DIR, 0);
+	tmpl = nf_ct_tmpl_alloc(net, &zone, GFP_ATOMIC);
+	if (!tmpl) {
+		pr_err("Failed to allocate conntrack template\n");
+		goto error;
+	}
+
+	nf_conntrack_get(&tmpl->ct_general);
+	nf_ct_set(skb, tmpl, IP_CT_NEW);
+    
+    hook_state.pf = info->family;
+    hook_state.net = net;
+    hook_state.hook = NF_INET_PRE_ROUTING;
+
+	do {
+		err = nf_conntrack_in(skb, &hook_state);
+	} while (err != NF_ACCEPT);
+
+	ct = nf_ct_get(skb, &ctinfo);
+	if (!ct) {
+		pr_err("nf_ct_get failed\n");
+		goto error;
+	}
+
+	if (info->mark_mask) {
+		err = bpf_skb_ct_set_mark(skb, info->mark_value,
+					  info->mark_mask);
+		if (err)
+			goto error;
+	}
+
+	if (labels_nonzero(info->ct_label_mask)) {
+		err = bpf_skb_ct_set_labels(skb, info->ct_label_value,
+					    info->ct_label_mask);
+		if (err)
+			goto error;
+	}
+
+	/* place into conntrack hash table. */
+	if (nf_conntrack_confirm(skb) != NF_ACCEPT) {
+		pr_err("Failed to confirm\n");
+		goto error;
+	}
+error:
+	skb_push_rcsum(skb, nh_ofs);
+	return TC_ACT_OK;
+}
+
+static const struct bpf_func_proto bpf_skb_ct_commit_proto = {
+	.func		= bpf_skb_ct_commit,
+	.gpl_only	= true,
+	.ret_type	= RET_INTEGER,
+	.arg1_type	= ARG_PTR_TO_CTX,
+	.arg2_type	= ARG_PTR_TO_MEM,
+	.arg3_type	= ARG_ANYTHING,
+};
+
 BPF_CALL_5(bpf_skb_event_output, struct sk_buff *, skb, struct bpf_map *, map,
 	   u64, flags, void *, meta, u64, meta_size)
 {
@@ -5935,6 +6167,10 @@ tc_cls_act_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 		return &bpf_skb_fib_lookup_proto;
 	case BPF_FUNC_sk_fullsock:
 		return &bpf_sk_fullsock_proto;
+    case BPF_FUNC_skb_ct_lookup:
+		return &bpf_skb_ct_lookup_proto;
+	case BPF_FUNC_skb_ct_commit:
+		return &bpf_skb_ct_commit_proto;
 #ifdef CONFIG_XFRM
 	case BPF_FUNC_skb_get_xfrm_state:
 		return &bpf_skb_get_xfrm_state_proto;
