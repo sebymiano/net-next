@@ -2763,11 +2763,16 @@ static bool check_refcount_ok(const struct bpf_func_proto *fn, int func_id)
 	return count <= 1;
 }
 
-static int check_func_proto(const struct bpf_func_proto *fn, int func_id)
+static int check_func_proto(struct bpf_verifier_env *env, const struct bpf_func_proto *fn, int func_id)
 {
-	return check_raw_mode_ok(fn) &&
-	       check_arg_pair_ok(fn) &&
-	       check_refcount_ok(fn, func_id) ? 0 : -EINVAL;
+    int raw = check_raw_mode_ok(fn);
+    int arg_pair = check_arg_pair_ok(fn);
+    int refcnt = check_refcount_ok(fn, func_id) ? 0 : -EINVAL;
+    verbose(env, "raw: %d, arg_pair: %d, refcnt: %d\n",
+			raw, arg_pair, refcnt);
+	return raw &&
+	       arg_pair &&
+	       refcnt;
 }
 
 /* Packet data might have moved, any old PTR_TO_PACKET[_META,_END]
@@ -3047,7 +3052,7 @@ static int check_helper_call(struct bpf_verifier_env *env, int func_id, int insn
 	/* With LD_ABS/IND some JITs save/restore skb from r1. */
 	changes_data = bpf_helper_changes_pkt_data(fn->func);
 	if (changes_data && fn->arg1_type != ARG_PTR_TO_CTX) {
-		verbose(env, "kernel subsystem misconfigured func %s#%d: r1 != ctx\n",
+		verbose(env, "kernel subsystem misconfigured func1 %s#%d: r1 != ctx\n",
 			func_id_name(func_id), func_id);
 		return -EINVAL;
 	}
@@ -3055,9 +3060,9 @@ static int check_helper_call(struct bpf_verifier_env *env, int func_id, int insn
 	memset(&meta, 0, sizeof(meta));
 	meta.pkt_access = fn->pkt_access;
 
-	err = check_func_proto(fn, func_id);
+	err = check_func_proto(env, fn, func_id);
 	if (err) {
-		verbose(env, "kernel subsystem misconfigured func %s#%d\n",
+		verbose(env, "kernel subsystem misconfigured func2 %s#%d\n",
 			func_id_name(func_id), func_id);
 		return err;
 	}
@@ -7788,7 +7793,7 @@ patch_call_imm:
 		 */
 		if (!fn->func) {
 			verbose(env,
-				"kernel subsystem misconfigured func %s#%d\n",
+				"kernel subsystem misconfigured func3 %s#%d\n",
 				func_id_name(insn->imm), insn->imm);
 			return -EFAULT;
 		}
